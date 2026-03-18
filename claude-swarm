@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Claude Code Multi-Agent Swarm via Tmux + Git Worktrees
+# Usage: claude-swarm [repo-path] [num-workers]
+#
+# Prerequisites:
+#   brew install tmux
+#   Claude Code CLI installed (https://docs.anthropic.com/en/docs/claude-code)
+#
+# Examples:
+#   claude-swarm ~/my-project           # admin + 2 workers (default)
+#   claude-swarm ~/my-project 4         # admin + 4 workers
+#   claude-swarm .                       # current directory
+
+REPO="${1:-.}"
+NUM_WORKERS="${2:-2}"
+SESSION="claude-swarm"
+WORKTREE_BASE="/tmp/claude-worktrees"
+SHARED_DIR="/tmp/claude-shared"
+WAIT_BETWEEN_AGENTS=12  # seconds to wait between launching agents (memory)
+
+# --- Find claude binary ---
+CLAUDE_BIN=""
+for candidate in \
+  "$HOME/.claude/bin/claude" \
+  "$HOME/.local/bin/claude" \
+  "/usr/local/bin/claude" \
+  "/opt/homebrew/bin/claude"; do
+  if [ -x "$candidate" ]; then
+    CLAUDE_BIN="$candidate"
+    break
+  fi
+done
+
+# Try PATH as fallback
+if [ -z "$CLAUDE_BIN" ]; then
+  CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+fi
+
+if [ -z "$CLAUDE_BIN" ]; then
+  echo "Error: claude not found. Install it from https://docs.anthropic.com/en/docs/claude-code"
+  echo "Common locations: ~/.claude/bin/claude, ~/.local/bin/claude"
+  exit 1
+fi
+
+CLAUDE_DIR="$(dirname "$CLAUDE_BIN")"
+echo "Found claude at: $CLAUDE_BIN"
+
+# --- Resolve repo path ---
+REPO="$(cd "$REPO" && pwd)"
+REPO_NAME="$(basename "$REPO")"
+
+# --- Validate git repo ---
+if ! git -C "$REPO" rev-parse --is-inside-work-tree &>/dev/null; then
+  echo "Error: $REPO is not a git repository"
+  exit 1
+fi
+
+BRANCH="$(git -C "$REPO" branch --show-current)"
+
+# --- Check for uncommitted changes ---
+if ! git -C "$REPO" diff --quiet HEAD 2>/dev/null; then
+  echo "Warning: uncommitted changes in $REPO. Worktrees will branch from current HEAD."
+  echo "Consider committing first. Continuing in 3 seconds..."
+  sleep 3
+fi
+
+# --- Clean up old worktrees ---
+echo "Setting up worktrees..."
+mkdir -p "$WORKTREE_BASE"
+for i in $(seq 1 "$NUM_WORKERS"); do
+  WT="$WORKTREE_BASE/${REPO_NAME}-worker${i}"
+  if [ -d "$WT" ]; then
+    git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
+  fi
+done
+git -C "$REPO" worktree prune 2>/dev/null
+
+# --- Create shared communication directory ---
+rm -rf "$SHARED_DIR"
+mkdir -p "$SHARED_DIR"/{status,tasks,results,messages,prompts}
+
+# --- Write system prompts to files ---
+PROMPT_DIR="$SHARED_DIR/prompts"
+
+WORKER_LIST=""
+for i in $(seq 1 "$NUM_WORKERS"); do
+  WORKER_LIST="${WORKER_LIST}worker${i} "
+done
+
+cat > "$PROMPT_DIR/admin.md" << EOF
+You are the ADMIN AGENT coordinating a team of ${NUM_WORKERS} worker agents.
+
+ENVIRONMENT:
+- You are in tmux session '${SESSION}', window 'admin'
+- Workers are in windows: ${WORKER_LIST}
+- Shared directory: ${SHARED_DIR} (use for coordination)
+- Main repo: ${REPO} (on branch: ${BRANCH})
+- Each worker has its own git worktree so they can work independently
+
+HOW TO COMMUNICATE WITH WORKERS:
+1. Send a message: tmux send-keys -t ${SESSION}:worker1 "your message here"
+2. Then hit enter:  tmux send-keys -t ${SESSION}:worker1 Enter
+IMPORTANT: These MUST be two separate commands. Never combine them.
+
+HOW TO CHECK WORKER STATUS:
+- tmux capture-pane -t ${SESSION}:worker1 -p | tail -20
+- Read ${SHARED_DIR}/status/worker1.md
+
+WORKFLOW:
+1. Wait for instructions from the user
+2. Break work into tasks and assign to workers
+3. Monitor progress via shared dir and tmux
+4. Coordinate merging results back to main branch
+
+Write your status to ${SHARED_DIR}/status/admin.md regularly.
+EOF
+
+for i in $(seq 1 "$NUM_WORKERS"); do
+  WT="$WORKTREE_BASE/${REPO_NAME}-worker${i}"
+  cat > "$PROMPT_DIR/worker${i}.md" << EOF
+You are WORKER AGENT ${i}.
+
+ENVIRONMENT:
+- You are in tmux session '${SESSION}', window 'worker${i}'
+- Your worktree: ${WT}
+- Shared directory: ${SHARED_DIR}
+- Admin is in window 'admin'
+
+HOW TO COMMUNICATE WITH ADMIN:
+1. tmux send-keys -t ${SESSION}:admin "your message here"
+2. tmux send-keys -t ${SESSION}:admin Enter
+IMPORTANT: These MUST be two separate commands.
+
+WORKFLOW:
+1. Wait for tasks from admin (check ${SHARED_DIR}/tasks/ or receive via tmux)
+2. Do the work in your worktree
+3. Write results to ${SHARED_DIR}/results/
+4. Update ${SHARED_DIR}/status/worker${i}.md with your progress
+5. Notify admin when done
+
+Stay focused on assigned tasks. Commit your work to your worktree branch.
+EOF
+done
+
+# --- Kill existing session ---
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+# --- Create tmux session ---
+echo "Creating tmux session: $SESSION"
+tmux new-session -d -s "$SESSION" -n "admin" -x 200 -y 50
+
+# --- Create worker worktrees and windows ---
+for i in $(seq 1 "$NUM_WORKERS"); do
+  WT="$WORKTREE_BASE/${REPO_NAME}-worker${i}"
+  WORKER_BRANCH="worker-${i}-$(date +%s)"
+
+  echo "Creating worktree: worker${i} -> $WT"
+  git -C "$REPO" worktree add -b "$WORKER_BRANCH" "$WT" "$BRANCH"
+
+  tmux new-window -t "$SESSION" -n "worker${i}"
+done
+
+# --- Create monitor window ---
+tmux new-window -t "$SESSION" -n "monitor"
+
+# --- Launch claude in each window (staggered to avoid memory spikes) ---
+echo ""
+echo "Launching agents (${WAIT_BETWEEN_AGENTS}s between each to manage memory)..."
+
+# Admin
+echo "  Starting admin..."
+tmux send-keys -t "${SESSION}:admin" "cd '${REPO}'" Enter
+sleep 0.5
+tmux send-keys -t "${SESSION}:admin" "export PATH='${CLAUDE_DIR}':\$PATH" Enter
+sleep 0.5
+tmux send-keys -t "${SESSION}:admin" "claude --dangerously-skip-permissions" Enter
+sleep "$WAIT_BETWEEN_AGENTS"
+
+# Send admin its instructions
+tmux send-keys -t "${SESSION}:admin" "Read ${PROMPT_DIR}/admin.md for your role and instructions. You are the Admin Agent. Acknowledge and wait for my task."
+tmux send-keys -t "${SESSION}:admin" Enter
+
+# Workers
+for i in $(seq 1 "$NUM_WORKERS"); do
+  WT="$WORKTREE_BASE/${REPO_NAME}-worker${i}"
+  echo "  Starting worker${i}..."
+  tmux send-keys -t "${SESSION}:worker${i}" "cd '${WT}'" Enter
+  sleep 0.5
+  tmux send-keys -t "${SESSION}:worker${i}" "export PATH='${CLAUDE_DIR}':\$PATH" Enter
+  sleep 0.5
+  tmux send-keys -t "${SESSION}:worker${i}" "claude --dangerously-skip-permissions" Enter
+  sleep "$WAIT_BETWEEN_AGENTS"
+
+  # Send worker its instructions
+  tmux send-keys -t "${SESSION}:worker${i}" "Read ${PROMPT_DIR}/worker${i}.md for your role and instructions. You are Worker Agent ${i}. Acknowledge and wait for tasks from admin."
+  tmux send-keys -t "${SESSION}:worker${i}" Enter
+done
+
+# --- Monitor loop ---
+tmux send-keys -t "${SESSION}:monitor" "while true; do clear; echo '=== Agent Monitor ===' ; echo '' ; date ; echo '' ; for w in admin ${WORKER_LIST}; do echo \"--- \$w ---\" ; tmux capture-pane -t ${SESSION}:\$w -p 2>/dev/null | tail -5 ; echo '' ; done ; echo '--- Status Files ---' ; ls '${SHARED_DIR}/status/' 2>/dev/null ; sleep 120 ; done" Enter
+
+# --- Switch to admin ---
+tmux select-window -t "${SESSION}:admin"
+
+echo ""
+echo "=== Claude Swarm Ready ==="
+echo ""
+echo "Session:  $SESSION"
+echo "Admin:    ${SESSION}:admin  (repo: $REPO, branch: $BRANCH)"
+for i in $(seq 1 "$NUM_WORKERS"); do
+  echo "Worker${i}:  ${SESSION}:worker${i}  (worktree: $WORKTREE_BASE/${REPO_NAME}-worker${i})"
+done
+echo "Monitor:  ${SESSION}:monitor"
+echo "Shared:   $SHARED_DIR"
+echo "Claude:   $CLAUDE_BIN"
+echo ""
+echo ">>> Attach with: tmux attach -t $SESSION"
+echo ""
+echo "Navigation:"
+echo "  Ctrl+b 1    — admin"
+for i in $(seq 1 "$NUM_WORKERS"); do
+  echo "  Ctrl+b $((i+1))    — worker${i}"
+done
+echo "  Ctrl+b $((NUM_WORKERS+2))    — monitor"
+echo "  Ctrl+b d    — detach (agents keep running)"
+echo ""
+echo "Cleanup:"
+echo "  tmux kill-session -t $SESSION"
+echo "  cd '$REPO' && git worktree prune"
