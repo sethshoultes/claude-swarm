@@ -2,6 +2,8 @@
 
 A shell script that launches a coordinated team of Claude Code agents in tmux — each with its own git worktree — that can delegate tasks, communicate through send-keys, and build across multiple codebases simultaneously.
 
+https://youtu.be/ahcOcMX2od0
+
 ## Prerequisites
 
 1. **tmux** — terminal multiplexer
