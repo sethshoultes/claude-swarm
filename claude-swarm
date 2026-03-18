@@ -117,6 +117,31 @@ WORKFLOW:
 Write your status to ${SHARED_DIR}/status/admin.md regularly.
 EOF
 
+cat > "$PROMPT_DIR/auto-start.md" << EOF
+AUTOMATIC STARTUP TASK:
+
+You just launched with a team of ${NUM_WORKERS} workers. Do the following immediately:
+
+1. Read the codebase structure: list files and directories, read any README.md, CLAUDE.md, package.json, composer.json, or config files to understand the project.
+
+2. Identify the ${NUM_WORKERS} most distinct areas of the codebase (e.g. frontend, backend, API, database, services, tests, infrastructure, docs). If the project has obvious subdirectories or modules, use those as boundaries.
+
+3. For each worker, send them an onboarding task via tmux send-keys telling them:
+   - Which directory/area they own
+   - To read and understand all the code in that area
+   - To write a brief summary of what they found to ${SHARED_DIR}/status/workerN.md
+   - To wait for further tasks after they finish studying
+
+4. After dispatching all workers, write your own assessment to ${SHARED_DIR}/status/admin.md including:
+   - Project overview
+   - How you divided the work
+   - Any issues or concerns you noticed
+
+5. Then tell the user (who is watching this window) that the swarm is initialized and ready for instructions.
+
+Remember: send the message and Enter as TWO SEPARATE tmux send-keys commands. Wait a few seconds between dispatching each worker.
+EOF
+
 for i in $(seq 1 "$NUM_WORKERS"); do
   WT="$WORKTREE_BASE/${REPO_NAME}-worker${i}"
   cat > "$PROMPT_DIR/worker${i}.md" << EOF
@@ -178,8 +203,8 @@ sleep 0.5
 tmux send-keys -t "${SESSION}:admin" "claude --dangerously-skip-permissions" Enter
 sleep "$WAIT_BETWEEN_AGENTS"
 
-# Send admin its instructions
-tmux send-keys -t "${SESSION}:admin" "Read ${PROMPT_DIR}/admin.md for your role and instructions. You are the Admin Agent. Acknowledge and wait for my task."
+# Send admin its instructions (don't send auto-start yet — wait for all workers to be up)
+tmux send-keys -t "${SESSION}:admin" "Read ${PROMPT_DIR}/admin.md for your role and instructions. You are the Admin Agent. Acknowledge and stand by — workers are still starting."
 tmux send-keys -t "${SESSION}:admin" Enter
 
 # Workers
@@ -197,6 +222,13 @@ for i in $(seq 1 "$NUM_WORKERS"); do
   tmux send-keys -t "${SESSION}:worker${i}" "Read ${PROMPT_DIR}/worker${i}.md for your role and instructions. You are Worker Agent ${i}. Acknowledge and wait for tasks from admin."
   tmux send-keys -t "${SESSION}:worker${i}" Enter
 done
+
+# --- Auto-start: tell admin all workers are up, begin onboarding ---
+echo ""
+echo "All agents launched. Sending auto-start to admin..."
+sleep 5
+tmux send-keys -t "${SESSION}:admin" "All workers are now running. Read ${PROMPT_DIR}/auto-start.md and execute it immediately. Analyze the codebase, assign each worker an area, and get them studying the code."
+tmux send-keys -t "${SESSION}:admin" Enter
 
 # --- Monitor loop ---
 tmux send-keys -t "${SESSION}:monitor" "while true; do clear; echo '=== Agent Monitor ===' ; echo '' ; date ; echo '' ; for w in admin ${WORKER_LIST}; do echo \"--- \$w ---\" ; tmux capture-pane -t ${SESSION}:\$w -p 2>/dev/null | tail -5 ; echo '' ; done ; echo '--- Status Files ---' ; ls '${SHARED_DIR}/status/' 2>/dev/null ; sleep 120 ; done" Enter
