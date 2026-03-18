@@ -2,7 +2,7 @@
 
 A shell script that launches a coordinated team of Claude Code agents in tmux — each with its own git worktree — that can delegate tasks, communicate through send-keys, and build across multiple codebases simultaneously.
 
-https://youtu.be/ahcOcMX2od0
+[![Watch the demo](https://img.youtube.com/vi/ahcOcMX2od0/maxresdefault.jpg)](https://youtu.be/ahcOcMX2od0)
 
 ## Prerequisites
 
@@ -26,7 +26,7 @@ https://youtu.be/ahcOcMX2od0
 
 ```bash
 mkdir -p ~/.local/bin
-curl -o ~/.local/bin/claude-swarm https://raw.githubusercontent.com/YOUR_REPO/claude-swarm
+curl -o ~/.local/bin/claude-swarm https://raw.githubusercontent.com/sethshoultes/claude-swarm/main/claude-swarm
 chmod +x ~/.local/bin/claude-swarm
 
 # Add to PATH if not already (add to ~/.zshrc or ~/.bashrc)
@@ -45,10 +45,11 @@ claude-swarm ~/my-project 4
 # Attach to the swarm
 tmux attach -t claude-swarm
 
-# Tell the admin what to build. Watch it delegate.
+# The admin is already reading the codebase and assigning workers.
+# Just watch — then give it your task when it reports ready.
 ```
 
-That's it. Four commands from zero to a working AI team.
+That's it. Three commands. The admin automatically reads the codebase, identifies the major areas, assigns each worker a section to study, and reports back when the swarm is ready for instructions.
 
 ## Architecture
 
@@ -117,7 +118,8 @@ tmux capture-pane -t claude-swarm:worker1 -p | tail -20
 6. Creates a tmux session with named windows
 7. Launches `claude --dangerously-skip-permissions` in each window with staggered starts (12s apart to avoid memory spikes)
 8. Sends each agent its instructions from the prompt files
-9. Starts a monitor loop that checks agent status every 2 minutes
+9. **Auto-starts the admin** — it reads the codebase, identifies major areas, and sends each worker to study their assigned area automatically
+10. Starts a monitor loop that checks agent status every 2 minutes
 
 ## Navigating the Swarm
 
